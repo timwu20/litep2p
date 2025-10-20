@@ -525,7 +525,7 @@ impl TransportService {
         let connection =
             &mut self.connections.get_mut(&peer).ok_or(Error::PeerDoesntExist(peer))?;
 
-        tracing::trace!(
+        tracing::info!(
             target: LOG_TARGET,
             ?peer,
             protocol = %self.protocol,

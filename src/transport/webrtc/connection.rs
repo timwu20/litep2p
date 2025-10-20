@@ -36,7 +36,8 @@ use crate::{
     PeerId,
 };
 
-use futures::{Stream, StreamExt};
+use futures::{channel, Stream, StreamExt, future::select_all};
+
 use indexmap::IndexMap;
 use str0m::{
     channel::{ChannelConfig, ChannelId},
@@ -46,13 +47,9 @@ use str0m::{
 use tokio::{net::UdpSocket, sync::mpsc::Receiver};
 
 use std::{
-    collections::HashMap,
-    net::SocketAddr,
-    pin::Pin,
-    sync::Arc,
-    task::{Context, Poll},
-    time::Instant,
+    collections::{HashMap, HashSet}, future::Future, net::SocketAddr, pin::Pin, sync::Arc, task::{Context, Poll}, time::Instant
 };
+use core::time::Duration;
 
 /// Logging target for the file.
 const LOG_TARGET: &str = "litep2p::webrtc::connection";
@@ -199,6 +196,9 @@ pub struct WebRtcConnection {
 
     /// Substream handles.
     handles: SubstreamHandleSet,
+
+    delay_close: Vec<(ChannelId, Pin<Box<dyn Future<Output = ()> + Send>>)>,
+    delay_close_mapped: HashSet<ChannelId>,
 }
 
 impl WebRtcConnection {
@@ -225,6 +225,8 @@ impl WebRtcConnection {
             pending_outbound: HashMap::new(),
             channels: HashMap::new(),
             handles: SubstreamHandleSet::new(),
+            delay_close: Vec::new(),
+            delay_close_mapped: HashSet::new(),
         }
     }
 
@@ -284,11 +286,11 @@ impl WebRtcConnection {
 
     /// Handle closed channel.
     async fn on_channel_closed(&mut self, channel_id: ChannelId) -> crate::Result<()> {
-        tracing::trace!(
+        tracing::info!(
             target: LOG_TARGET,
             peer = ?self.peer,
             ?channel_id,
-            "channel closed",
+            "channel closed1",
         );
 
         self.pending_outbound.remove(&channel_id);
@@ -445,9 +447,16 @@ impl WebRtcConnection {
         channel_id: ChannelId,
         data: Vec<u8>,
     ) -> crate::Result<()> {
+        tracing::debug!(
+            target: LOG_TARGET,
+            peer = ?self.peer,
+            ?channel_id,
+            data_len = ?data.len(),
+            "handle data for an open channel",
+        );
         let message = WebRtcMessage::decode(&data)?;
 
-        tracing::trace!(
+        tracing::debug!(
             target: LOG_TARGET,
             peer = ?self.peer,
             ?channel_id,
@@ -631,6 +640,8 @@ impl WebRtcConnection {
             protocol: protocol.to_string(),
         });
 
+        self.rtc.channel(channel_id).unwrap().set_buffered_amount_low_threshold(1024);
+
         tracing::trace!(
             target: LOG_TARGET,
             peer = ?self.peer,
@@ -680,6 +691,36 @@ impl WebRtcConnection {
             .await;
 
         loop {
+            // Check for completed delay futures before polling rtc
+            // let mut i = 0;
+            // while i < self.delay_close.len() {
+            //     let (channel_id, fut) = &mut self.delay_close[i];
+            //     let ready = futures::future::poll_fn(|cx| {
+            //         match fut.as_mut().poll(cx) {
+            //             Poll::Ready(()) => Poll::Ready(true),
+            //             Poll::Pending => Poll::Ready(false),
+            //         }
+            //     }).await;
+            //     if ready {
+            //         tracing::info!(
+            //             target: LOG_TARGET,
+            //             peer = ?self.peer,
+            //             ?channel_id,
+            //             "delay future completed, proceeding with close",
+            //         );
+            //         self.delay_close_mapped.remove(channel_id);
+            //         // Close the channel
+            //         self.rtc.direct_api().close_data_channel(*channel_id);
+            //         self.channels.insert(*channel_id, ChannelState::Closing);
+            //         self.handles.remove(channel_id);
+            //         // Remove from delay_close
+            //         self.delay_close.swap_remove(i);
+            //         // Don't increment i since we swapped
+            //     } else {
+            //         i += 1;
+            //     }
+            // }
+
             // poll output until we get a timeout
             let timeout = match self.rtc.poll_output().unwrap() {
                 Output::Timeout(v) => v,
@@ -742,8 +783,30 @@ impl WebRtcConnection {
 
                         continue;
                     }
+                    Event::ChannelBufferedAmountLow(channel_id) => {
+                        tracing::info!(
+                            target: LOG_TARGET,
+                            peer = ?self.peer,
+                            ?channel_id,
+                            "buffered amount low",
+                        );
+
+                        if let Some(ChannelState::Closing) = self.channels.get(&channel_id) {
+                            tracing::info!(
+                                target: LOG_TARGET,
+                                peer = ?self.peer,
+                                ?channel_id,
+                                "buffer drained, closing channel",
+                            );
+                            self.rtc.direct_api().close_data_channel(channel_id);
+                            self.handles.remove(&channel_id);
+                            self.channels.remove(&channel_id);
+                        }
+
+                        continue;
+                    }
                     event => {
-                        tracing::debug!(
+                        tracing::info!(
                             target: LOG_TARGET,
                             peer = ?self.peer,
                             ?event,
@@ -792,12 +855,45 @@ impl WebRtcConnection {
                             target: LOG_TARGET,
                             peer = ?self.peer,
                             ?channel_id,
-                            "channel closed",
+                            "channel closed0",
                         );
 
-                        self.rtc.direct_api().close_data_channel(channel_id);
+                        // let mut channel = self.rtc.channel(channel_id).unwrap();
+                        // let ba = channel.buffered_amount();
+                        // tracing::info!(
+                        //     target: LOG_TARGET,
+                        //     peer = ?self.peer,
+                        //     ?channel_id,
+                        //     buffered_amount = ?ba,
+                        //     "buffered amount on channel close",
+                        // );
+
+                        // if ba > 0 {
+                        //     tracing::debug!(
+                        //         target: LOG_TARGET,
+                        //         peer = ?self.peer,
+                        //         ?channel_id,
+                        //         "deferring close until buffer drains",
+                        //     );
+                        // }
+                        //     self.rtc.direct_api().close_data_channel(channel_id);
+                        //     self.channels.insert(channel_id, ChannelState::Closing);
+                        //     self.handles.remove(&channel_id);
+                        // }
+                        
                         self.channels.insert(channel_id, ChannelState::Closing);
-                        self.handles.remove(&channel_id);
+
+                        // if !self.delay_close_mapped.contains(&channel_id) {
+                        //     tracing::info!(
+                        //         target: LOG_TARGET,
+                        //         peer = ?self.peer,
+                        //         ?channel_id,
+                        //         "scheduling delayed close",
+                        //     );
+                        //     let delay_future = Box::pin(tokio::time::sleep(Duration::from_millis(5000))); // Example delay
+                        //     self.delay_close.push((channel_id, delay_future));
+                        //     self.delay_close_mapped.insert(channel_id);
+                        // }
                     }
                     Some((channel_id, Some(SubstreamEvent::Message(data)))) => {
                         if let Err(error) = self.on_outbound_data(channel_id, data) {
@@ -813,7 +909,7 @@ impl WebRtcConnection {
                 },
                 command = self.protocol_set.next() => match command {
                     None | Some(ProtocolCommand::ForceClose) => {
-                        tracing::trace!(
+                        tracing::info!(
                             target: LOG_TARGET,
                             peer = ?self.peer,
                             ?command,
